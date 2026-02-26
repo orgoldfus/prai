@@ -1,0 +1,118 @@
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+use super::comment_list::CommentEntry;
+use super::status_bar::{self, KeyHint};
+use super::theme;
+
+/// Render a full-screen detail view for a single comment.
+pub fn render(frame: &mut Frame, entry: &CommentEntry) {
+    let area = frame.area();
+
+    let [header_area, body_area, diff_area, status_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Percentage(40),
+        Constraint::Min(4),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    // ── Header ────────────────────────────────────────────────────────
+    let location = if let Some(line) = entry.line {
+        format!("{}:{line}", entry.path)
+    } else {
+        entry.path.clone()
+    };
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(" 🙏 PRAI", theme::accent()),
+            Span::styled("  │  ", theme::border()),
+            Span::styled("Comment Detail", theme::text()),
+        ]),
+        Line::from(vec![
+            Span::styled("   📄 ", theme::accent()),
+            Span::styled(&location, theme::text()),
+            Span::styled("  by ", theme::subtext()),
+            Span::styled(format!("@{}", entry.author), theme::author()),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(theme::border()),
+    )
+    .style(theme::text());
+
+    frame.render_widget(header, header_area);
+
+    // ── Comment body ──────────────────────────────────────────────────
+    let body_text: Vec<Line<'_>> = entry
+        .body
+        .lines()
+        .map(|l| Line::styled(l, theme::text()))
+        .collect();
+
+    let body = Paragraph::new(Text::from(body_text))
+        .block(
+            Block::default()
+                .title(" Comment ")
+                .title_style(theme::accent())
+                .borders(Borders::ALL)
+                .border_style(theme::border()),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(body, body_area);
+
+    // ── Diff hunk ─────────────────────────────────────────────────────
+    render_diff(frame, diff_area, &entry.diff_hunk);
+
+    // ── Status bar ────────────────────────────────────────────────────
+    status_bar::render(
+        frame,
+        status_area,
+        &[
+            KeyHint { key: "a", desc: "Send to agent" },
+            KeyHint { key: "o", desc: "Browser" },
+            KeyHint { key: "t", desc: "👍" },
+            KeyHint { key: "q", desc: "Back" },
+        ],
+    );
+}
+
+fn render_diff(frame: &mut Frame, area: Rect, diff_hunk: &str) {
+    let lines: Vec<Line<'_>> = if diff_hunk.is_empty() {
+        vec![Line::styled("  (no diff context available)", theme::subtext())]
+    } else {
+        diff_hunk
+            .lines()
+            .map(|l| {
+                let style = if l.starts_with('+') {
+                    theme::diff_add()
+                } else if l.starts_with('-') {
+                    theme::diff_del()
+                } else if l.starts_with("@@") {
+                    theme::subtext()
+                } else {
+                    theme::text()
+                };
+                Line::styled(format!("  {l}"), style)
+            })
+            .collect()
+    };
+
+    let diff = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(" Diff Context ")
+                .title_style(theme::accent())
+                .borders(Borders::ALL)
+                .border_style(theme::border()),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(diff, area);
+}
