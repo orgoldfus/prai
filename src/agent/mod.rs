@@ -1,5 +1,6 @@
 pub mod cursor;
 pub mod provider;
+pub mod stream;
 
 use crate::github::types::{PullRequest, ReviewComment};
 
@@ -8,9 +9,7 @@ use crate::github::types::{PullRequest, ReviewComment};
 /// When multiple comments are provided they are all included so the agent
 /// can address them in a single pass.
 pub fn build_prompt(pr: &PullRequest, comments: &[&ReviewComment]) -> String {
-    let mut prompt = String::from(
-        "You are fixing code review comments on a pull request.\n\n",
-    );
+    let mut prompt = String::from("You are fixing code review comments on a pull request.\n\n");
 
     // ── PR context ────────────────────────────────────────────────────
     prompt.push_str("## PR Context\n");

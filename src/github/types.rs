@@ -30,6 +30,7 @@ pub struct PrAuthor {
 /// A review thread on a pull request, containing one or more comments.
 #[derive(Debug, Clone)]
 pub struct ReviewThread {
+    pub id: String,
     pub is_resolved: bool,
     pub comments: Vec<ReviewComment>,
 }
@@ -54,4 +55,5 @@ pub struct ReviewComment {
     pub author: String,
     pub created_at: String,
     pub url: String,
+    pub has_thumbs_up: bool,
 }

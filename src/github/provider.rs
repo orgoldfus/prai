@@ -11,10 +11,7 @@ use super::types::{PullRequest, ReviewThread};
 #[allow(dead_code)]
 pub trait GitProvider: Send + Sync {
     /// List open pull requests authored by the given user.
-    fn list_open_prs(
-        &self,
-        author: &str,
-    ) -> impl Future<Output = Result<Vec<PullRequest>>> + Send;
+    fn list_open_prs(&self, author: &str) -> impl Future<Output = Result<Vec<PullRequest>>> + Send;
 
     /// Look up a single PR by number.
     fn get_pr(&self, number: u64) -> impl Future<Output = Result<PullRequest>> + Send;
@@ -45,13 +42,10 @@ pub trait GitProvider: Send + Sync {
         reaction: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Post a reply to a review thread.
-    fn reply_to_comment(
+    /// Post a reply to a review thread using the thread's node ID.
+    fn reply_to_thread(
         &self,
-        owner: &str,
-        repo: &str,
-        pr_number: u64,
-        comment_id: &str,
+        thread_id: &str,
         body: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 }
