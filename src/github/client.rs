@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -28,9 +28,11 @@ impl GitHubClient {
 
     /// Run a GraphQL query via `gh api graphql`.
     async fn graphql(&self, query: &str) -> Result<Value> {
-        let output = self.gh(&["api", "graphql", "-f", &format!("query={query}")]).await?;
-        let value: Value = serde_json::from_str(&output)
-            .context("failed to parse GraphQL response")?;
+        let output = self
+            .gh(&["api", "graphql", "-f", &format!("query={query}")])
+            .await?;
+        let value: Value =
+            serde_json::from_str(&output).context("failed to parse GraphQL response")?;
 
         if let Some(errors) = value.get("errors") {
             bail!("GraphQL errors: {errors}");
@@ -115,6 +117,7 @@ impl GitProvider for GitHubClient {
                 pullRequest(number: {pr_number}) {{
                   reviewThreads(first: 100) {{
                     nodes {{
+                      id
                       isResolved
                       comments(first: 50) {{
                         nodes {{
@@ -127,6 +130,9 @@ impl GitProvider for GitHubClient {
                           author {{ login }}
                           createdAt
                           url
+                          reactions(content: THUMBS_UP, first: 1) {{
+                            totalCount
+                          }}
                         }}
                       }}
                     }}
@@ -145,6 +151,7 @@ impl GitProvider for GitHubClient {
 
         let mut threads = Vec::new();
         for thread in threads_arr {
+            let thread_id = thread["id"].as_str().unwrap_or_default().to_owned();
             let is_resolved = thread["isResolved"].as_bool().unwrap_or(false);
             let comments_json = &thread["comments"]["nodes"];
             let Some(comments_arr) = comments_json.as_array() else {
@@ -166,10 +173,12 @@ impl GitProvider for GitHubClient {
                         .to_owned(),
                     created_at: c["createdAt"].as_str().unwrap_or_default().to_owned(),
                     url: c["url"].as_str().unwrap_or_default().to_owned(),
+                    has_thumbs_up: c["reactions"]["totalCount"].as_u64().unwrap_or(0) > 0,
                 })
                 .collect();
 
             threads.push(ReviewThread {
+                id: thread_id,
                 is_resolved,
                 comments,
             });
@@ -220,30 +229,20 @@ impl GitProvider for GitHubClient {
         Ok(())
     }
 
-    async fn reply_to_comment(
-        &self,
-        owner: &str,
-        repo: &str,
-        pr_number: u64,
-        comment_id: &str,
-        body: &str,
-    ) -> Result<()> {
-        // Use REST API to reply to a pull request review comment.
-        let endpoint = format!(
-            "repos/{owner}/{repo}/pulls/{pr_number}/comments/{comment_id}/replies"
+    async fn reply_to_thread(&self, thread_id: &str, body: &str) -> Result<()> {
+        let body_escaped = body
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let query = format!(
+            r#"mutation {{
+              addPullRequestReviewThreadReply(input: {{pullRequestReviewThreadId: "{thread_id}", body: "{body_escaped}"}}) {{
+                comment {{ id }}
+              }}
+            }}"#
         );
-        let body_escaped = body.replace('"', r#"\""#);
 
-        self.gh(&[
-            "api",
-            &endpoint,
-            "-f",
-            &format!("body={body_escaped}"),
-            "--method",
-            "POST",
-        ])
-        .await?;
-
+        self.graphql(&query).await?;
         Ok(())
     }
 }

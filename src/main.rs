@@ -5,7 +5,7 @@ mod git;
 mod github;
 mod ui;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::Parser;
 
 use crate::config::Config;

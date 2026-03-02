@@ -76,6 +76,9 @@ prai --config
 | `↑/↓` or `j/k` | Navigate |
 | `Space` | Toggle select |
 | `a` | Send to AI agent |
+| `l` | Toggle agent output panel |
+| `v` | Toggle output view (UI/raw) |
+| `[` / `]` | Switch agent job in panel |
 | `m` | Choose model |
 | `o` | Open in browser |
 | `t` | 👍 React |

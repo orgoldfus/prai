@@ -1,9 +1,12 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::provider::{AgentProvider, AgentResult};
+use super::stream::StreamChunk;
 
 /// Cursor CLI agent — invokes `cursor-agent` (Cursor's CLI binary) in print mode.
 #[derive(Debug, Default)]
@@ -15,12 +18,8 @@ impl CursorAgent {
 
     /// Compile-time default model list — only used on the very first run
     /// before a successful live fetch has populated the disk cache.
-    const DEFAULTS: &'static [&'static str] = &[
-        "claude-4-sonnet",
-        "claude-4-opus",
-        "gpt-5",
-        "cursor-small",
-    ];
+    const DEFAULTS: &'static [&'static str] =
+        &["claude-4-sonnet", "claude-4-opus", "gpt-5", "cursor-small"];
 
     /// Path to the on-disk model cache: `~/.config/prai/models_cache.json`.
     fn cache_path() -> Option<std::path::PathBuf> {
@@ -81,6 +80,92 @@ impl CursorAgent {
         }
         Self::DEFAULTS.iter().map(|s| s.to_string()).collect()
     }
+
+    pub async fn execute_with_stream(
+        prompt: &str,
+        model: Option<&str>,
+        working_dir: &Path,
+        log_tx: UnboundedSender<StreamChunk>,
+    ) -> Result<AgentResult> {
+        let mut cmd = tokio::process::Command::new(Self::BIN);
+        cmd.current_dir(working_dir)
+            .arg("-p")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--stream-partial-output")
+            .arg(prompt)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(model) = model {
+            cmd.arg("--model").arg(model);
+        }
+
+        let mut child = cmd.spawn().context("failed to execute Cursor CLI agent")?;
+
+        let stdout_task = child.stdout.take().map(|stdout| {
+            let tx = log_tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                let mut collected = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = tx.send(StreamChunk::Stdout(line.clone()));
+                    collected.push(line);
+                }
+                collected
+            })
+        });
+
+        let stderr_task = child.stderr.take().map(|stderr| {
+            let tx = log_tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                let mut collected = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = tx.send(StreamChunk::Stderr(line.clone()));
+                    collected.push(line);
+                }
+                collected
+            })
+        });
+
+        let status = child
+            .wait()
+            .await
+            .context("failed waiting for Cursor CLI")?;
+        let _ = log_tx.send(StreamChunk::System(format!(
+            "process exited with status: {}",
+            status.code().unwrap_or(-1)
+        )));
+
+        let stdout_lines = match stdout_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let stderr_lines = match stderr_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        let stdout = stdout_lines.join("\n");
+        let stderr = stderr_lines.join("\n");
+
+        if status.success() {
+            Ok(AgentResult {
+                success: true,
+                message: if stdout.is_empty() {
+                    "Agent completed successfully.".to_owned()
+                } else {
+                    stdout
+                },
+            })
+        } else {
+            Ok(AgentResult {
+                success: false,
+                message: if stderr.is_empty() { stdout } else { stderr },
+            })
+        }
+    }
 }
 
 impl AgentProvider for CursorAgent {
@@ -139,9 +224,7 @@ impl AgentProvider for CursorAgent {
         working_dir: &Path,
     ) -> Result<AgentResult> {
         let mut cmd = tokio::process::Command::new(Self::BIN);
-        cmd.current_dir(working_dir)
-            .arg("-p")
-            .arg(prompt);
+        cmd.current_dir(working_dir).arg("-p").arg(prompt);
 
         if let Some(model) = model {
             cmd.arg("--model").arg(model);

@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 /// Information about the current git repository.
 #[derive(Debug, Clone)]
@@ -53,20 +53,14 @@ pub fn repo_info() -> Result<RepoInfo> {
 fn parse_remote_url(url: &str) -> Result<RepoInfo> {
     // SSH: git@github.com:owner/repo.git
     if let Some(path) = url.strip_prefix("git@") {
-        let path = path
-            .split_once(':')
-            .map(|(_, p)| p)
-            .unwrap_or(path);
+        let path = path.split_once(':').map(|(_, p)| p).unwrap_or(path);
         return parse_owner_repo(path);
     }
 
     // HTTPS: https://github.com/owner/repo.git
     if let Some(path) = url.strip_prefix("https://") {
         // Skip the host part (github.com/)
-        let path = path
-            .split_once('/')
-            .map(|(_, p)| p)
-            .unwrap_or(path);
+        let path = path.split_once('/').map(|(_, p)| p).unwrap_or(path);
         return parse_owner_repo(path);
     }
 
@@ -98,16 +92,14 @@ mod tests {
 
     #[test]
     fn parse_https_url() {
-        let info =
-            parse_remote_url("https://github.com/orgoldfus/prai.git").unwrap();
+        let info = parse_remote_url("https://github.com/orgoldfus/prai.git").unwrap();
         assert_eq!(info.owner, "orgoldfus");
         assert_eq!(info.name, "prai");
     }
 
     #[test]
     fn parse_https_url_without_git_suffix() {
-        let info =
-            parse_remote_url("https://github.com/orgoldfus/prai").unwrap();
+        let info = parse_remote_url("https://github.com/orgoldfus/prai").unwrap();
         assert_eq!(info.owner, "orgoldfus");
         assert_eq!(info.name, "prai");
     }

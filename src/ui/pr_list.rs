@@ -1,7 +1,7 @@
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::Frame;
 
 use crate::github::types::PullRequest;
 
@@ -79,10 +79,7 @@ pub fn render(frame: &mut Frame, state: &mut PrListState) {
             let line = Line::from(vec![
                 Span::styled(format!("#{:<6}", pr.number), theme::accent()),
                 Span::styled(&pr.title, theme::text()),
-                Span::styled(
-                    format!("  ({})", pr.head_ref_name),
-                    theme::subtext(),
-                ),
+                Span::styled(format!("  ({})", pr.head_ref_name), theme::subtext()),
             ]);
             ListItem::new(line)
         })
@@ -106,9 +103,18 @@ pub fn render(frame: &mut Frame, state: &mut PrListState) {
         frame,
         status_area,
         &[
-            KeyHint { key: "↑↓", desc: "Navigate" },
-            KeyHint { key: "Enter", desc: "Select" },
-            KeyHint { key: "q", desc: "Quit" },
+            KeyHint {
+                key: "↑↓",
+                desc: "Navigate",
+            },
+            KeyHint {
+                key: "Enter",
+                desc: "Select",
+            },
+            KeyHint {
+                key: "q",
+                desc: "Quit",
+            },
         ],
     );
 }

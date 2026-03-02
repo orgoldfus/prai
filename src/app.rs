@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -5,18 +6,26 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::DefaultTerminal;
+use throbber_widgets_tui::ThrobberState;
+use tokio::task::JoinHandle;
 
 use crate::agent::cursor::CursorAgent;
-use crate::agent::provider::AgentProvider;
+use crate::agent::provider::{AgentProvider, AgentResult};
+use crate::agent::stream::{parse_stream_chunk, AgentStreamEvent, StreamChunk};
 use crate::agent::{self};
 use crate::config::Config;
 use crate::git;
 use crate::github::client::GitHubClient;
 use crate::github::provider::GitProvider;
 use crate::github::types::ReviewComment;
-use crate::ui::comment_list::{CommentEntry, CommentListState};
+use crate::ui::agent_timeline::{AgentOutputMode, AgentTimeline};
+use crate::ui::comment_list::{
+    AgentJobStatus as AgentJobStatusUi, AgentJobSummary, AgentPanelView, CommentEntry,
+    CommentListState, ThreadReply,
+};
 use crate::ui::pr_list::PrListState;
-use crate::ui::{self, ModelSelectorState, splash};
+use crate::ui::reply::ReplyState;
+use crate::ui::{self, splash, ModelSelectorState};
 
 // ── Screens ───────────────────────────────────────────────────────────────
 
@@ -39,6 +48,29 @@ enum Screen {
 enum Popup {
     None,
     ModelSelector(ModelSelectorState),
+    Reply(ReplyState),
+}
+
+// ── Agent jobs ────────────────────────────────────────────────────────────
+
+struct AgentJob {
+    id: u64,
+    model: String,
+    comment_ids: Vec<String>,
+    started_at: Instant,
+    finished_at: Option<Instant>,
+    status: AgentJobStatus,
+    handle: Option<JoinHandle<Result<AgentResult>>>,
+    stream_rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+    timeline: AgentTimeline,
+    unread_lines: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentJobStatus {
+    Running,
+    Success,
+    Failed,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────
@@ -46,6 +78,7 @@ enum Popup {
 pub struct App {
     config: Config,
     github: GitHubClient,
+    #[allow(dead_code)]
     agent: CursorAgent,
     screen: Screen,
     popup: Popup,
@@ -60,11 +93,26 @@ pub struct App {
     /// Cached repo info.
     repo_owner: String,
     repo_name: String,
+    /// In-flight agent tasks.
+    agent_jobs: Vec<AgentJob>,
+    /// Comment IDs that were successfully handled by an agent in this app session.
+    handled_comment_ids: HashSet<String>,
+    next_agent_job_id: u64,
+    show_agent_panel: bool,
+    selected_agent_job: usize,
+    output_mode: AgentOutputMode,
+    animation_started_at: Instant,
+    /// Spinner animation state for running agent indicators.
+    pub throbber_state: ThrobberState,
     /// Whether the app should quit.
     should_quit: bool,
 }
 
 impl App {
+    const MAX_JOB_LOG_LINES: usize = 1200;
+    const MAX_JOB_TIMELINE_NODES: usize = 600;
+    const MAX_JOB_TIMELINE_CHARS: usize = 24_000;
+
     /// Create the app with the given config and optionally a pre-selected PR number.
     pub async fn new(config: Config, pr_number: Option<u64>) -> Result<Self> {
         let github = GitHubClient;
@@ -72,13 +120,9 @@ impl App {
 
         let repo_info = git::repo_info().context("failed to read git remote")?;
 
-        // Use the instant fallback list (disk cache → compile-time defaults)
-        // so the app starts immediately, without waiting for the CLI.
         let fallback = CursorAgent::fallback_models();
         let selected_model = config.agent.default_model.clone();
 
-        // Spawn the live model fetch in the background. The result will be
-        // picked up on the next event-loop tick (or when the user presses `m`).
         let bg_models: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
         {
             let slot = Arc::clone(&bg_models);
@@ -92,7 +136,6 @@ impl App {
         }
 
         let screen = if let Some(number) = pr_number {
-            // Go directly to comment list.
             let pr = github.get_pr(number).await?;
             let threads = github
                 .get_review_threads(&repo_info.owner, &repo_info.name, number)
@@ -115,16 +158,22 @@ impl App {
             bg_models,
             repo_owner: repo_info.owner,
             repo_name: repo_info.name,
+            agent_jobs: Vec::new(),
+            handled_comment_ids: HashSet::new(),
+            next_agent_job_id: 1,
+            show_agent_panel: false,
+            selected_agent_job: 0,
+            output_mode: AgentOutputMode::Ui,
+            animation_started_at: Instant::now(),
+            throbber_state: ThrobberState::default(),
             should_quit: false,
         })
     }
 
-    /// If the background model-fetch task has completed, swap in the live list.
     fn poll_bg_models(&mut self) {
         if let Ok(mut slot) = self.bg_models.try_lock() {
             if let Some(models) = slot.take() {
                 self.cached_models = models;
-                // Re-validate the selected model against the fresh list.
                 if !self.cached_models.contains(&self.selected_model) {
                     if let Some(first) = self.cached_models.first() {
                         self.selected_model = first.clone();
@@ -134,36 +183,156 @@ impl App {
         }
     }
 
+    /// Collect comment IDs currently being processed by an agent.
+    fn running_comment_ids(&self) -> HashSet<String> {
+        self.agent_jobs
+            .iter()
+            .filter(|j| j.status == AgentJobStatus::Running)
+            .flat_map(|j| j.comment_ids.iter().cloned())
+            .collect()
+    }
+
+    /// Check completed agent jobs and report results.
+    fn poll_agent_jobs(&mut self) {
+        for idx in 0..self.agent_jobs.len() {
+            let is_selected = self.selected_agent_job_index() == Some(idx) && self.show_agent_panel;
+            while let Ok(chunk) = self.agent_jobs[idx].stream_rx.try_recv() {
+                self.agent_jobs[idx]
+                    .timeline
+                    .push_raw_line(chunk.raw_line());
+                if let Some(event) = parse_stream_chunk(&chunk) {
+                    self.agent_jobs[idx].timeline.apply_event(event);
+                }
+                if !is_selected {
+                    self.agent_jobs[idx].unread_lines += 1;
+                }
+            }
+        }
+
+        let mut finished = Vec::new();
+        for (idx, job) in self.agent_jobs.iter().enumerate() {
+            if job.status == AgentJobStatus::Running
+                && job.handle.as_ref().is_some_and(|h| h.is_finished())
+            {
+                finished.push(idx);
+            }
+        }
+
+        for idx in finished {
+            let count = self.agent_jobs[idx].comment_ids.len();
+            let result = self.agent_jobs[idx]
+                .handle
+                .take()
+                .and_then(|h| h.now_or_never());
+
+            match result {
+                Some(Ok(Ok(r))) if r.success => {
+                    self.agent_jobs[idx].status = AgentJobStatus::Success;
+                    self.agent_jobs[idx].finished_at = Some(Instant::now());
+                    self.agent_jobs[idx].timeline.mark_complete(true, None);
+                    let handled_ids = self.agent_jobs[idx].comment_ids.clone();
+                    self.handled_comment_ids.extend(handled_ids);
+                    self.set_screen_message(
+                        format!("✅ Agent completed ({count} comment(s))"),
+                        false,
+                    );
+                }
+                Some(Ok(Ok(r))) => {
+                    self.agent_jobs[idx].status = AgentJobStatus::Failed;
+                    self.agent_jobs[idx].finished_at = Some(Instant::now());
+                    self.agent_jobs[idx]
+                        .timeline
+                        .mark_complete(false, Some(&r.message));
+                    self.set_screen_message(format!("❌ Agent failed: {}", r.message), true);
+                }
+                Some(Ok(Err(e))) => {
+                    self.agent_jobs[idx].status = AgentJobStatus::Failed;
+                    self.agent_jobs[idx].finished_at = Some(Instant::now());
+                    self.agent_jobs[idx]
+                        .timeline
+                        .mark_complete(false, Some(&e.to_string()));
+                    self.set_screen_message(format!("❌ Agent error: {e}"), true);
+                }
+                Some(Err(e)) => {
+                    self.agent_jobs[idx].status = AgentJobStatus::Failed;
+                    self.agent_jobs[idx].finished_at = Some(Instant::now());
+                    self.agent_jobs[idx]
+                        .timeline
+                        .mark_complete(false, Some(&e.to_string()));
+                    self.set_screen_message(format!("❌ Agent panic: {e}"), true);
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn selected_agent_job_index(&self) -> Option<usize> {
+        if self.agent_jobs.is_empty() {
+            None
+        } else {
+            Some(self.selected_agent_job.min(self.agent_jobs.len() - 1))
+        }
+    }
+
+    fn clear_selected_agent_unread(&mut self) {
+        if let Some(idx) = self.selected_agent_job_index() {
+            self.agent_jobs[idx].unread_lines = 0;
+        }
+    }
+
+    fn select_next_agent_job(&mut self) {
+        if self.agent_jobs.is_empty() {
+            return;
+        }
+        self.selected_agent_job = (self.selected_agent_job + 1) % self.agent_jobs.len();
+        self.clear_selected_agent_unread();
+    }
+
+    fn select_prev_agent_job(&mut self) {
+        if self.agent_jobs.is_empty() {
+            return;
+        }
+        self.selected_agent_job = self
+            .selected_agent_job
+            .checked_sub(1)
+            .unwrap_or(self.agent_jobs.len() - 1);
+        self.clear_selected_agent_unread();
+    }
+
+    fn set_screen_message(&mut self, msg: String, is_error: bool) {
+        match &mut self.screen {
+            Screen::CommentList(state) => state.set_message(msg, is_error),
+            Screen::CommentDetail { parent, .. } => parent.set_message(msg, is_error),
+            _ => {}
+        }
+    }
+
     // ── Main loop ─────────────────────────────────────────────────────
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         loop {
-            // Check if the background model fetch has completed.
             self.poll_bg_models();
+            self.poll_agent_jobs();
+            self.throbber_state.calc_next();
 
-            // Draw.
             terminal.draw(|frame| self.render(frame))?;
 
             if self.should_quit {
                 break;
             }
 
-            // Handle automatic transitions (splash → next screen).
             if let Screen::Splash { shown_at } = &self.screen {
                 let elapsed = shown_at.elapsed();
-                let splash_dur =
-                    Duration::from_millis(self.config.ui.splash_duration_ms);
+                let splash_dur = Duration::from_millis(self.config.ui.splash_duration_ms);
 
                 if elapsed >= splash_dur {
                     self.transition_from_splash().await?;
                     continue;
                 }
 
-                // Poll with a short timeout so we can transition once time is up.
                 let remaining = splash_dur - elapsed;
                 if event::poll(remaining.min(Duration::from_millis(50)))? {
                     if let Event::Key(key) = event::read()? {
-                        // Any key press skips the splash.
                         if key.kind == event::KeyEventKind::Press {
                             self.transition_from_splash().await?;
                         }
@@ -172,7 +341,6 @@ impl App {
                 continue;
             }
 
-            // Normal event handling.
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != event::KeyEventKind::Press {
@@ -189,39 +357,94 @@ impl App {
     // ── Rendering ─────────────────────────────────────────────────────
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
+        let running = self.running_comment_ids();
+        let running_count = self
+            .agent_jobs
+            .iter()
+            .filter(|j| j.status == AgentJobStatus::Running)
+            .count();
+        let pulse_on = (self.animation_started_at.elapsed().as_millis() / 450).is_multiple_of(2);
+
+        let agent_panel = AgentPanelView {
+            visible: self.show_agent_panel,
+            selected_idx: self.selected_agent_job_index(),
+            output_mode: self.output_mode,
+            pulse_on,
+            jobs: self
+                .agent_jobs
+                .iter()
+                .map(|job| AgentJobSummary {
+                    id: job.id,
+                    model: &job.model,
+                    comment_count: job.comment_ids.len(),
+                    status: match job.status {
+                        AgentJobStatus::Running => AgentJobStatusUi::Running,
+                        AgentJobStatus::Success => AgentJobStatusUi::Success,
+                        AgentJobStatus::Failed => AgentJobStatusUi::Failed,
+                    },
+                    unread_lines: job.unread_lines,
+                    elapsed: job
+                        .finished_at
+                        .unwrap_or_else(Instant::now)
+                        .duration_since(job.started_at),
+                })
+                .collect(),
+            selected_timeline: self
+                .selected_agent_job_index()
+                .and_then(|idx| self.agent_jobs.get(idx))
+                .map(|j| &j.timeline),
+        };
+
         match &mut self.screen {
             Screen::Splash { .. } => splash::render(frame),
             Screen::PrList(state) => ui::pr_list::render(frame, state),
-            Screen::CommentList(state) => ui::comment_list::render(frame, state),
+            Screen::CommentList(state) => {
+                ui::comment_list::render(
+                    frame,
+                    state,
+                    &running,
+                    &self.handled_comment_ids,
+                    &self.throbber_state,
+                    running_count,
+                    &agent_panel,
+                );
+            }
             Screen::CommentDetail { entry, .. } => {
                 ui::comment_detail::render(frame, entry);
             }
         }
 
-        // Render popup overlay.
-        if let Popup::ModelSelector(ref mut state) = self.popup {
-            ui::render_model_selector(frame, state);
+        match &mut self.popup {
+            Popup::ModelSelector(ref mut state) => {
+                ui::render_model_selector(frame, state);
+            }
+            Popup::Reply(ref state) => {
+                ui::reply::render(frame, state);
+            }
+            Popup::None => {}
         }
     }
 
     // ── Key handling ──────────────────────────────────────────────────
 
     async fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
-        // Ctrl+C always quits.
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return Ok(());
         }
 
-        // If a popup is open, route keys to it.
-        if matches!(self.popup, Popup::ModelSelector(_)) {
-            return self.handle_popup_key(code);
+        match &self.popup {
+            Popup::ModelSelector(_) => return self.handle_popup_key(code),
+            Popup::Reply(_) => return self.handle_reply_key(code, modifiers).await,
+            Popup::None => {}
         }
 
         match &self.screen {
-            Screen::Splash { .. } => {} // handled in the loop above
+            Screen::Splash { .. } => {}
             Screen::PrList(_) => self.handle_pr_list_key(code).await?,
-            Screen::CommentList(_) => self.handle_comment_list_key(code).await?,
+            Screen::CommentList(_) => {
+                self.handle_comment_list_key(code, modifiers).await?;
+            }
             Screen::CommentDetail { .. } => {
                 self.handle_comment_detail_key(code).await?;
             }
@@ -259,18 +482,34 @@ impl App {
 
     // ── Comment list keys ─────────────────────────────────────────────
 
-    async fn handle_comment_list_key(&mut self, code: KeyCode) -> Result<()> {
-        // We need to take ownership of the screen temporarily for some actions.
+    async fn handle_comment_list_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        let running = self.running_comment_ids();
+
         let Screen::CommentList(ref mut state) = self.screen else {
             return Ok(());
         };
 
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                // Go back to PR list.
                 let prs = self.github.list_open_prs("@me").await?;
                 self.screen = Screen::PrList(PrListState::new(prs));
             }
+            KeyCode::Char('l') => {
+                self.show_agent_panel = !self.show_agent_panel;
+                if self.show_agent_panel && !self.agent_jobs.is_empty() {
+                    self.selected_agent_job = self.agent_jobs.len() - 1;
+                    self.clear_selected_agent_unread();
+                }
+            }
+            KeyCode::Char('v') => {
+                self.output_mode = self.output_mode.toggle();
+            }
+            KeyCode::Char(']') => self.select_next_agent_job(),
+            KeyCode::Char('[') => self.select_prev_agent_job(),
             KeyCode::Down | KeyCode::Char('j') => {
                 state.clear_message();
                 state.next();
@@ -279,13 +518,21 @@ impl App {
                 state.clear_message();
                 state.previous();
             }
-            KeyCode::Char(' ') => state.toggle_select(),
+            KeyCode::Char(' ') => state.toggle_select(&running),
+            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.select_all(&running);
+            }
+            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.deselect_all();
+            }
             KeyCode::Enter => {
                 if let Some(entry) = state.current_entry().cloned() {
-                    // Move into detail view, preserving comment list state.
-                    let Screen::CommentList(cl_state) =
-                        std::mem::replace(&mut self.screen, Screen::Splash { shown_at: Instant::now() })
-                    else {
+                    let Screen::CommentList(cl_state) = std::mem::replace(
+                        &mut self.screen,
+                        Screen::Splash {
+                            shown_at: Instant::now(),
+                        },
+                    ) else {
                         unreachable!();
                     };
                     self.screen = Screen::CommentDetail {
@@ -312,7 +559,10 @@ impl App {
                         )
                         .await
                     {
-                        Ok(()) => state.set_message("👍 Reaction added!", false),
+                        Ok(()) => {
+                            state.mark_reacted(&entry.comment_id);
+                            state.set_message("👍 Reaction added!", false);
+                        }
                         Err(e) => state.set_message(format!("Error: {e}"), true),
                     }
                 }
@@ -324,7 +574,16 @@ impl App {
                 ));
             }
             KeyCode::Char('a') => {
-                self.send_to_agent().await?;
+                self.send_to_agent()?;
+            }
+            KeyCode::Char('r') => {
+                if let Some(entry) = state.current_entry().cloned() {
+                    self.popup = Popup::Reply(ReplyState::new(
+                        entry.thread_id.clone(),
+                        state.pr.number,
+                        entry.path.clone(),
+                    ));
+                }
             }
             _ => {}
         }
@@ -336,10 +595,12 @@ impl App {
     async fn handle_comment_detail_key(&mut self, code: KeyCode) -> Result<()> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                // Go back to comment list.
-                let Screen::CommentDetail { parent, .. } =
-                    std::mem::replace(&mut self.screen, Screen::Splash { shown_at: Instant::now() })
-                else {
+                let Screen::CommentDetail { parent, .. } = std::mem::replace(
+                    &mut self.screen,
+                    Screen::Splash {
+                        shown_at: Instant::now(),
+                    },
+                ) else {
                     unreachable!();
                 };
                 self.screen = Screen::CommentList(*parent);
@@ -350,59 +611,35 @@ impl App {
                 }
             }
             KeyCode::Char('t') => {
-                if let Screen::CommentDetail { entry, .. } = &self.screen {
-                    let _ = self
-                        .github
-                        .add_reaction(
-                            &self.repo_owner,
-                            &self.repo_name,
-                            &entry.comment_id,
-                            "THUMBS_UP",
-                        )
-                        .await;
+                let comment_id = if let Screen::CommentDetail { entry, .. } = &self.screen {
+                    entry.comment_id.clone()
+                } else {
+                    return Ok(());
+                };
+                let result = self
+                    .github
+                    .add_reaction(&self.repo_owner, &self.repo_name, &comment_id, "THUMBS_UP")
+                    .await;
+                if let Screen::CommentDetail { parent, .. } = &mut self.screen {
+                    match result {
+                        Ok(()) => {
+                            parent.mark_reacted(&comment_id);
+                            parent.set_message("👍 Reaction added!".to_owned(), false);
+                        }
+                        Err(e) => parent.set_message(format!("Error: {e}"), true),
+                    }
                 }
             }
             KeyCode::Char('a') => {
-                // Send the current detail comment to the agent.
+                self.send_detail_to_agent()?;
+            }
+            KeyCode::Char('r') => {
                 if let Screen::CommentDetail { entry, parent } = &self.screen {
-                    let pr = &parent.pr;
-                    let comment = ReviewComment {
-                        id: entry.comment_id.clone(),
-                        body: entry.body.clone(),
-                        path: entry.path.clone(),
-                        line: entry.line,
-                        start_line: None,
-                        diff_hunk: entry.diff_hunk.clone(),
-                        author: entry.author.clone(),
-                        created_at: String::new(),
-                        url: entry.url.clone(),
-                    };
-                    let prompt = agent::build_prompt(pr, &[&comment]);
-                    let cwd = env::current_dir()?;
-                    let result = self
-                        .agent
-                        .execute(&prompt, Some(&self.selected_model), &cwd)
-                        .await?;
-
-                    // Return to the comment list with a status message.
-                    let Screen::CommentDetail { parent, .. } = std::mem::replace(
-                        &mut self.screen,
-                        Screen::Splash {
-                            shown_at: Instant::now(),
-                        },
-                    ) else {
-                        unreachable!();
-                    };
-                    let mut cl_state = *parent;
-                    if result.success {
-                        cl_state.set_message("✅ Agent completed successfully!", false);
-                    } else {
-                        cl_state.set_message(
-                            format!("❌ Agent failed: {}", result.message),
-                            true,
-                        );
-                    }
-                    self.screen = Screen::CommentList(cl_state);
+                    self.popup = Popup::Reply(ReplyState::new(
+                        entry.thread_id.clone(),
+                        parent.pr.number,
+                        entry.path.clone(),
+                    ));
                 }
             }
             _ => {}
@@ -426,29 +663,59 @@ impl App {
                 }
                 self.popup = Popup::None;
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.popup = Popup::None;
             }
+            KeyCode::Backspace => state.pop_filter_char(),
+            KeyCode::Char(c) => state.push_filter_char(c),
             _ => {}
         }
         Ok(())
     }
 
+    // ── Reply popup keys ──────────────────────────────────────────────
+
+    async fn handle_reply_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        if code == KeyCode::Esc {
+            self.popup = Popup::None;
+            return Ok(());
+        }
+
+        if code == KeyCode::Char('s') && modifiers.contains(KeyModifiers::CONTROL) {
+            return self.submit_reply().await;
+        }
+
+        let Popup::Reply(ref mut state) = self.popup else {
+            return Ok(());
+        };
+        state.handle_input(code, modifiers);
+
+        Ok(())
+    }
+
     // ── Actions ───────────────────────────────────────────────────────
 
-    /// Send the selected comments (or the current one) to the AI agent.
-    async fn send_to_agent(&mut self) -> Result<()> {
+    /// Send selected comments to the agent as a background task.
+    fn send_to_agent(&mut self) -> Result<()> {
+        let running = self.running_comment_ids();
+
         let Screen::CommentList(ref mut state) = self.screen else {
             return Ok(());
         };
 
         let entries = state.selected_entries();
+
+        let entries: Vec<&CommentEntry> = entries
+            .into_iter()
+            .filter(|e| !running.contains(&e.comment_id))
+            .collect();
+
         if entries.is_empty() {
-            state.set_message("No comments to send", true);
+            state.set_message("Already running for selected comments", true);
             return Ok(());
         }
 
-        // Build review comments from entries.
+        let comment_ids: Vec<String> = entries.iter().map(|e| e.comment_id.clone()).collect();
         let comments: Vec<ReviewComment> = entries
             .iter()
             .map(|e| ReviewComment {
@@ -461,31 +728,170 @@ impl App {
                 author: e.author.clone(),
                 created_at: String::new(),
                 url: e.url.clone(),
+                has_thumbs_up: false,
             })
             .collect();
 
         let comment_refs: Vec<&ReviewComment> = comments.iter().collect();
         let prompt = agent::build_prompt(&state.pr, &comment_refs);
+        let model = self.selected_model.clone();
+        let cwd = env::current_dir()?;
 
         let count = comments.len();
-        state.set_message(
-            format!("🚀 Sending {count} comment(s) to {}...", self.agent.name()),
-            false,
+        state.set_message(format!("🚀 Sent {count} comment(s) to agent"), false);
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let run_model = model.clone();
+        let handle = tokio::spawn(async move {
+            CursorAgent::execute_with_stream(&prompt, Some(&run_model), &cwd, stream_tx).await
+        });
+
+        let job_id = self.next_agent_job_id;
+        self.next_agent_job_id += 1;
+        let mut timeline = AgentTimeline::new(
+            Self::MAX_JOB_LOG_LINES,
+            Self::MAX_JOB_TIMELINE_NODES,
+            Self::MAX_JOB_TIMELINE_CHARS,
         );
-
-        let cwd = env::current_dir()?;
-        let result = self
-            .agent
-            .execute(&prompt, Some(&self.selected_model), &cwd)
-            .await?;
-
-        if result.success {
-            state.set_message("✅ Agent completed successfully!", false);
-        } else {
-            state.set_message(format!("❌ Agent failed: {}", result.message), true);
+        timeline.apply_event(AgentStreamEvent::Info("agent started".to_owned()));
+        self.agent_jobs.push(AgentJob {
+            id: job_id,
+            model,
+            comment_ids,
+            started_at: Instant::now(),
+            finished_at: None,
+            status: AgentJobStatus::Running,
+            handle: Some(handle),
+            stream_rx,
+            timeline,
+            unread_lines: 0,
+        });
+        self.selected_agent_job = self.agent_jobs.len() - 1;
+        if self.show_agent_panel {
+            self.clear_selected_agent_unread();
         }
 
         Ok(())
+    }
+
+    /// Send the currently viewed detail comment to the agent.
+    fn send_detail_to_agent(&mut self) -> Result<()> {
+        let running = self.running_comment_ids();
+
+        let Screen::CommentDetail { entry, parent } = &self.screen else {
+            return Ok(());
+        };
+
+        if running.contains(&entry.comment_id) {
+            return Ok(());
+        }
+
+        let comment = ReviewComment {
+            id: entry.comment_id.clone(),
+            body: entry.body.clone(),
+            path: entry.path.clone(),
+            line: entry.line,
+            start_line: None,
+            diff_hunk: entry.diff_hunk.clone(),
+            author: entry.author.clone(),
+            created_at: String::new(),
+            url: entry.url.clone(),
+            has_thumbs_up: false,
+        };
+        let prompt = agent::build_prompt(&parent.pr, &[&comment]);
+        let model = self.selected_model.clone();
+        let cwd = env::current_dir()?;
+        let comment_ids = vec![entry.comment_id.clone()];
+
+        let Screen::CommentDetail { parent, .. } = std::mem::replace(
+            &mut self.screen,
+            Screen::Splash {
+                shown_at: Instant::now(),
+            },
+        ) else {
+            unreachable!();
+        };
+        let mut cl_state = *parent;
+        cl_state.set_message("🚀 Sent comment to agent", false);
+        self.screen = Screen::CommentList(cl_state);
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let run_model = model.clone();
+        let handle = tokio::spawn(async move {
+            CursorAgent::execute_with_stream(&prompt, Some(&run_model), &cwd, stream_tx).await
+        });
+
+        let job_id = self.next_agent_job_id;
+        self.next_agent_job_id += 1;
+        let mut timeline = AgentTimeline::new(
+            Self::MAX_JOB_LOG_LINES,
+            Self::MAX_JOB_TIMELINE_NODES,
+            Self::MAX_JOB_TIMELINE_CHARS,
+        );
+        timeline.apply_event(AgentStreamEvent::Info("agent started".to_owned()));
+        self.agent_jobs.push(AgentJob {
+            id: job_id,
+            model,
+            comment_ids,
+            started_at: Instant::now(),
+            finished_at: None,
+            status: AgentJobStatus::Running,
+            handle: Some(handle),
+            stream_rx,
+            timeline,
+            unread_lines: 0,
+        });
+        self.selected_agent_job = self.agent_jobs.len() - 1;
+        if self.show_agent_panel {
+            self.clear_selected_agent_unread();
+        }
+
+        Ok(())
+    }
+
+    async fn submit_reply(&mut self) -> Result<()> {
+        let Popup::Reply(ref state) = self.popup else {
+            return Ok(());
+        };
+
+        let body = state.text();
+        if body.trim().is_empty() {
+            return Ok(());
+        }
+
+        let thread_id = state.thread_id.clone();
+        let body = body.to_owned();
+
+        self.popup = Popup::None;
+
+        match self.github.reply_to_thread(&thread_id, &body).await {
+            Ok(()) => {
+                self.set_screen_message("💬 Reply posted!".to_owned(), false);
+                self.add_reply_to_screen(&thread_id, "you".to_owned(), body);
+            }
+            Err(e) => self.set_screen_message(format!("Error: {e}"), true),
+        }
+
+        Ok(())
+    }
+
+    fn add_reply_to_screen(&mut self, thread_id: &str, author: String, body: String) {
+        match &mut self.screen {
+            Screen::CommentList(state) => {
+                state.add_reply_to_thread(thread_id, author, body);
+            }
+            Screen::CommentDetail { entry, parent } => {
+                if entry.thread_id == thread_id {
+                    entry.replies.push(ThreadReply {
+                        author: author.clone(),
+                        body: body.clone(),
+                        created_at: String::new(),
+                    });
+                }
+                parent.add_reply_to_thread(thread_id, author, body);
+            }
+            _ => {}
+        }
     }
 
     // ── Splash transition ─────────────────────────────────────────────
@@ -493,7 +899,6 @@ impl App {
     async fn transition_from_splash(&mut self) -> Result<()> {
         let branch = git::current_branch()?;
 
-        // Check if there's an open PR for the current branch.
         if let Some(pr) = self.github.find_pr_for_branch(&branch).await? {
             let threads = self
                 .github
@@ -501,11 +906,25 @@ impl App {
                 .await?;
             self.screen = Screen::CommentList(CommentListState::new(pr, &threads));
         } else {
-            // Fall back to listing all PRs by the current user.
             let prs = self.github.list_open_prs("@me").await?;
             self.screen = Screen::PrList(PrListState::new(prs));
         }
 
         Ok(())
+    }
+}
+
+/// Extension to get a result from a finished JoinHandle without async.
+trait JoinHandleExt<T> {
+    fn now_or_never(self) -> Option<std::result::Result<T, tokio::task::JoinError>>;
+}
+
+impl<T> JoinHandleExt<T> for JoinHandle<T> {
+    fn now_or_never(self) -> Option<std::result::Result<T, tokio::task::JoinError>> {
+        if self.is_finished() {
+            Some(futures::executor::block_on(self))
+        } else {
+            None
+        }
     }
 }

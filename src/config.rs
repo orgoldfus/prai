@@ -34,7 +34,6 @@ pub struct UiConfig {
 
 // ── Defaults ──────────────────────────────────────────────────────────────
 
-
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -92,8 +91,7 @@ impl Config {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let contents =
-            toml::to_string_pretty(self).context("failed to serialize config")?;
+        let contents = toml::to_string_pretty(self).context("failed to serialize config")?;
 
         fs::write(&path, contents)
             .with_context(|| format!("failed to write {}", path.display()))?;

@@ -39,7 +39,10 @@ pub fn accent() -> Style {
 
 /// Highlighted / selected item in a list.
 pub fn selected() -> Style {
-    Style::default().fg(MAUVE).bg(SURFACE0).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(MAUVE)
+        .bg(SURFACE0)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Border around panels.
