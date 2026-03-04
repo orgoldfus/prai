@@ -8,7 +8,16 @@ use crate::github::types::{PullRequest, ReviewComment};
 ///
 /// When multiple comments are provided they are all included so the agent
 /// can address them in a single pass.
+#[allow(dead_code)]
 pub fn build_prompt(pr: &PullRequest, comments: &[&ReviewComment]) -> String {
+    build_prompt_with_additional(pr, comments, None)
+}
+
+pub fn build_prompt_with_additional(
+    pr: &PullRequest,
+    comments: &[&ReviewComment],
+    additional_instructions: Option<&str>,
+) -> String {
     let mut prompt = String::from("You are fixing code review comments on a pull request.\n\n");
 
     // ── PR context ────────────────────────────────────────────────────
@@ -50,6 +59,15 @@ pub fn build_prompt(pr: &PullRequest, comments: &[&ReviewComment]) -> String {
          - If a comment is unclear, make your best judgement.\n",
     );
 
+    if let Some(extra) = additional_instructions
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        prompt.push_str("\n## Additional Instructions\n");
+        prompt.push_str(extra);
+        prompt.push('\n');
+    }
+
     prompt
 }
 
@@ -66,4 +84,72 @@ fn write_comment(buf: &mut String, c: &ReviewComment) {
         buf.push_str("\n```\n");
     }
     buf.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_prompt_with_additional;
+    use crate::github::types::{PrAuthor, PullRequest, ReviewComment};
+
+    fn sample_pr() -> PullRequest {
+        PullRequest {
+            number: 42,
+            title: "Improve parser".to_owned(),
+            body: "Refactor parser for readability.".to_owned(),
+            url: "https://example.com/pr/42".to_owned(),
+            head_ref_name: "feature/parser".to_owned(),
+            base_ref_name: "main".to_owned(),
+            created_at: String::new(),
+            author: PrAuthor::default(),
+        }
+    }
+
+    fn sample_comment() -> ReviewComment {
+        ReviewComment {
+            id: "c1".to_owned(),
+            body: "Handle empty input.".to_owned(),
+            path: "src/parser.rs".to_owned(),
+            line: Some(12),
+            start_line: None,
+            diff_hunk: "@@ -1,3 +1,3 @@".to_owned(),
+            author: "reviewer".to_owned(),
+            created_at: String::new(),
+            url: "https://example.com/comment/1".to_owned(),
+            has_thumbs_up: false,
+        }
+    }
+
+    #[test]
+    fn none_additional_instructions_does_not_add_section() {
+        let pr = sample_pr();
+        let comment = sample_comment();
+        let prompt = build_prompt_with_additional(&pr, &[&comment], None);
+
+        assert!(!prompt.contains("## Additional Instructions"));
+    }
+
+    #[test]
+    fn blank_additional_instructions_are_ignored() {
+        let pr = sample_pr();
+        let comment = sample_comment();
+        let prompt = build_prompt_with_additional(&pr, &[&comment], Some("  \n\t  "));
+
+        assert!(!prompt.contains("## Additional Instructions"));
+    }
+
+    #[test]
+    fn additional_instructions_are_appended_once() {
+        let pr = sample_pr();
+        let comment = sample_comment();
+        let prompt = build_prompt_with_additional(
+            &pr,
+            &[&comment],
+            Some("Follow project style.\nAvoid renaming public APIs."),
+        );
+
+        assert_eq!(prompt.matches("## Additional Instructions").count(), 1);
+        let base_idx = prompt.find("## Instructions").unwrap();
+        let add_idx = prompt.find("## Additional Instructions").unwrap();
+        assert!(add_idx > base_idx);
+    }
 }

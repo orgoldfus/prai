@@ -1,3 +1,4 @@
+pub mod additional_instructions;
 pub mod agent_timeline;
 pub mod comment_detail;
 pub mod comment_list;
@@ -5,6 +6,7 @@ pub mod pr_list;
 pub mod reply;
 pub mod splash;
 pub mod status_bar;
+pub mod text_buffer;
 pub mod theme;
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
