@@ -98,7 +98,7 @@ pub fn render(frame: &mut Frame, state: &mut PrListState) {
 
     frame.render_stateful_widget(list, list_area, &mut state.list_state);
 
-    // ── Status bar ────────────────────────────────────────────────────
+    // ── Status bar ──────────────────────────────────────────────────── 
     status_bar::render(
         frame,
         status_area,
@@ -117,4 +117,54 @@ pub fn render(frame: &mut Frame, state: &mut PrListState) {
             },
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::types::PrAuthor;
+
+    fn make_pr(number: u64) -> PullRequest {
+        PullRequest {
+            number,
+            title: format!("PR #{number}"),
+            body: String::new(),
+            url: format!("https://example.com/pr/{number}"),
+            head_ref_name: "feature".to_owned(),
+            base_ref_name: "main".to_owned(),
+            created_at: String::new(),
+            author: PrAuthor::default(),
+        }
+    }
+
+    #[test]
+    fn empty_list_navigation_is_safe() {
+        let mut state = PrListState::new(vec![]);
+        state.next();
+        state.previous();
+        assert_eq!(state.list_state.selected(), None);
+        assert!(state.selected_pr().is_none());
+    }
+
+    #[test]
+    fn new_selects_first() {
+        let state = PrListState::new(vec![make_pr(1), make_pr(2)]);
+        assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn next_wraps_around() {
+        let mut state = PrListState::new(vec![make_pr(1), make_pr(2)]);
+        state.next();
+        assert_eq!(state.list_state.selected(), Some(1));
+        state.next();
+        assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn previous_wraps_around() {
+        let mut state = PrListState::new(vec![make_pr(1), make_pr(2)]);
+        state.previous();
+        assert_eq!(state.list_state.selected(), Some(1));
+    }
 }

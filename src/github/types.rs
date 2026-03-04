@@ -44,16 +44,45 @@ impl ReviewThread {
 
 /// A single review comment within a thread.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ReviewComment {
     pub id: String,
     pub body: String,
     pub path: String,
     pub line: Option<u32>,
+    #[allow(dead_code)]
     pub start_line: Option<u32>,
     pub diff_hunk: String,
     pub author: String,
     pub created_at: String,
     pub url: String,
     pub has_thumbs_up: bool,
+}
+
+impl ReviewComment {
+    /// Build a `ReviewComment` from a UI `CommentEntry`.
+    ///
+    /// Fields that don't exist on the entry (`start_line`, `created_at`,
+    /// `has_thumbs_up`) are filled with defaults.
+    pub fn from_entry(
+        comment_id: &str,
+        body: &str,
+        path: &str,
+        line: Option<u32>,
+        diff_hunk: &str,
+        author: &str,
+        url: &str,
+    ) -> Self {
+        Self {
+            id: comment_id.to_owned(),
+            body: body.to_owned(),
+            path: path.to_owned(),
+            line,
+            start_line: None,
+            diff_hunk: diff_hunk.to_owned(),
+            author: author.to_owned(),
+            created_at: String::new(),
+            url: url.to_owned(),
+            has_thumbs_up: false,
+        }
+    }
 }

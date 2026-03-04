@@ -915,4 +915,39 @@ mod tests {
         let raw: Vec<String> = timeline.raw_logs().iter().cloned().collect();
         assert_eq!(raw, vec!["two".to_owned(), "three".to_owned()]);
     }
+
+    #[test]
+    fn mark_complete_success_adds_done_node() {
+        let mut timeline = AgentTimeline::new(100, 100, 10_000);
+        timeline.apply_event(AgentStreamEvent::Info("started".to_owned()));
+        timeline.mark_complete(true, None);
+        let lines = timeline.ui_lines(true).join("\n");
+        assert!(lines.contains("Completed") || lines.contains("✅"));
+    }
+
+    #[test]
+    fn mark_complete_failure_adds_error() {
+        let mut timeline = AgentTimeline::new(100, 100, 10_000);
+        timeline.mark_complete(false, Some("something broke"));
+        let lines = timeline.ui_lines(true).join("\n");
+        assert!(lines.contains("something broke"));
+    }
+
+    #[test]
+    fn done_event_is_deduplicated() {
+        let mut timeline = AgentTimeline::new(100, 100, 10_000);
+        timeline.apply_event(AgentStreamEvent::Done);
+        timeline.apply_event(AgentStreamEvent::Done);
+        let lines = timeline.ui_lines(true);
+        let done_count = lines.iter().filter(|l| l.contains("Completed")).count();
+        assert_eq!(done_count, 1);
+    }
+
+    #[test]
+    fn error_event_shows_in_ui() {
+        let mut timeline = AgentTimeline::new(100, 100, 10_000);
+        timeline.apply_event(AgentStreamEvent::Error("oops".to_owned()));
+        let lines = timeline.ui_lines(true).join("\n");
+        assert!(lines.contains("oops"));
+    }
 }

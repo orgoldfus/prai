@@ -103,4 +103,24 @@ mod tests {
         assert_eq!(info.owner, "orgoldfus");
         assert_eq!(info.name, "prai");
     }
+
+    #[test]
+    fn parse_ssh_url_without_git_suffix() {
+        let info = parse_remote_url("git@github.com:orgoldfus/prai").unwrap();
+        assert_eq!(info.owner, "orgoldfus");
+        assert_eq!(info.name, "prai");
+    }
+
+    #[test]
+    fn unrecognised_format_returns_error() {
+        let result = parse_remote_url("ftp://example.com/foo/bar.git");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_ssh_url_with_nested_path_takes_first_segment() {
+        let info = parse_remote_url("git@gitlab.com:group/project.git").unwrap();
+        assert_eq!(info.owner, "group");
+        assert_eq!(info.name, "project");
+    }
 }

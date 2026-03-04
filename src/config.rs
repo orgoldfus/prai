@@ -99,3 +99,58 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_values() {
+        let config = Config::default();
+        assert_eq!(config.agent.provider, "cursor");
+        assert_eq!(config.agent.default_model, "claude-4-sonnet");
+        assert_eq!(config.ui.theme, "catppuccin-mocha");
+        assert_eq!(config.ui.splash_duration_ms, 1500);
+    }
+
+    #[test]
+    fn round_trip_serialize_deserialize() {
+        let config = Config {
+            agent: AgentConfig {
+                provider: "test-agent".to_owned(),
+                default_model: "test-model".to_owned(),
+            },
+            ui: UiConfig {
+                theme: "dark".to_owned(),
+                splash_duration_ms: 500,
+            },
+        };
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.agent.provider, "test-agent");
+        assert_eq!(deserialized.agent.default_model, "test-model");
+        assert_eq!(deserialized.ui.theme, "dark");
+        assert_eq!(deserialized.ui.splash_duration_ms, 500);
+    }
+
+    #[test]
+    fn deserialize_partial_config_uses_defaults() {
+        let partial = r#"
+[agent]
+provider = "custom"
+"#;
+        let config: Config = toml::from_str(partial).unwrap();
+        assert_eq!(config.agent.provider, "custom");
+        assert_eq!(config.agent.default_model, "claude-4-sonnet");
+        assert_eq!(config.ui.splash_duration_ms, 1500);
+    }
+
+    #[test]
+    fn deserialize_empty_config_uses_all_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.agent.provider, "cursor");
+        assert_eq!(config.ui.theme, "catppuccin-mocha");
+    }
+}
