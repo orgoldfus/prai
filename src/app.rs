@@ -18,6 +18,7 @@ use crate::git;
 use crate::github::client::GitHubClient;
 use crate::github::provider::GitProvider;
 use crate::github::types::ReviewComment;
+use crate::ui::additional_instructions::AdditionalInstructionsState;
 use crate::ui::agent_timeline::{AgentOutputMode, AgentTimeline};
 use crate::ui::comment_list::{
     AgentJobStatus as AgentJobStatusUi, AgentJobSummary, AgentPanelView, CommentEntry,
@@ -49,6 +50,13 @@ enum Popup {
     None,
     ModelSelector(ModelSelectorState),
     Reply(ReplyState),
+    AdditionalInstructions(AdditionalInstructionsState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDispatchTarget {
+    CommentList,
+    CommentDetail,
 }
 
 // ── Agent jobs ────────────────────────────────────────────────────────────
@@ -421,6 +429,9 @@ impl App {
             Popup::Reply(ref state) => {
                 ui::reply::render(frame, state);
             }
+            Popup::AdditionalInstructions(ref state) => {
+                ui::additional_instructions::render(frame, state);
+            }
             Popup::None => {}
         }
     }
@@ -436,6 +447,11 @@ impl App {
         match &self.popup {
             Popup::ModelSelector(_) => return self.handle_popup_key(code),
             Popup::Reply(_) => return self.handle_reply_key(code, modifiers).await,
+            Popup::AdditionalInstructions(_) => {
+                return self
+                    .handle_additional_instructions_key(code, modifiers)
+                    .await;
+            }
             Popup::None => {}
         }
 
@@ -446,7 +462,7 @@ impl App {
                 self.handle_comment_list_key(code, modifiers).await?;
             }
             Screen::CommentDetail { .. } => {
-                self.handle_comment_detail_key(code).await?;
+                self.handle_comment_detail_key(code, modifiers).await?;
             }
         }
 
@@ -574,7 +590,9 @@ impl App {
                 ));
             }
             KeyCode::Char('a') => {
-                self.send_to_agent()?;
+                self.popup = Popup::AdditionalInstructions(AdditionalInstructionsState::new(
+                    AgentDispatchTarget::CommentList,
+                ));
             }
             KeyCode::Char('r') => {
                 if let Some(entry) = state.current_entry().cloned() {
@@ -592,7 +610,11 @@ impl App {
 
     // ── Comment detail keys ───────────────────────────────────────────
 
-    async fn handle_comment_detail_key(&mut self, code: KeyCode) -> Result<()> {
+    async fn handle_comment_detail_key(
+        &mut self,
+        code: KeyCode,
+        _modifiers: KeyModifiers,
+    ) -> Result<()> {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 let Screen::CommentDetail { parent, .. } = std::mem::replace(
@@ -631,7 +653,9 @@ impl App {
                 }
             }
             KeyCode::Char('a') => {
-                self.send_detail_to_agent()?;
+                self.popup = Popup::AdditionalInstructions(AdditionalInstructionsState::new(
+                    AgentDispatchTarget::CommentDetail,
+                ));
             }
             KeyCode::Char('r') => {
                 if let Screen::CommentDetail { entry, parent } = &self.screen {
@@ -693,10 +717,31 @@ impl App {
         Ok(())
     }
 
+    async fn handle_additional_instructions_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<()> {
+        if code == KeyCode::Esc {
+            self.popup = Popup::None;
+            return Ok(());
+        }
+
+        if code == KeyCode::Char('s') && modifiers.contains(KeyModifiers::CONTROL) {
+            return self.submit_additional_instructions().await;
+        }
+
+        let Popup::AdditionalInstructions(ref mut state) = self.popup else {
+            return Ok(());
+        };
+        state.handle_input(code, modifiers);
+        Ok(())
+    }
+
     // ── Actions ───────────────────────────────────────────────────────
 
     /// Send selected comments to the agent as a background task.
-    fn send_to_agent(&mut self) -> Result<()> {
+    fn send_to_agent(&mut self, additional_instructions: Option<&str>) -> Result<()> {
         let running = self.running_comment_ids();
 
         let Screen::CommentList(ref mut state) = self.screen else {
@@ -733,7 +778,8 @@ impl App {
             .collect();
 
         let comment_refs: Vec<&ReviewComment> = comments.iter().collect();
-        let prompt = agent::build_prompt(&state.pr, &comment_refs);
+        let prompt =
+            agent::build_prompt_with_additional(&state.pr, &comment_refs, additional_instructions);
         let model = self.selected_model.clone();
         let cwd = env::current_dir()?;
 
@@ -775,7 +821,7 @@ impl App {
     }
 
     /// Send the currently viewed detail comment to the agent.
-    fn send_detail_to_agent(&mut self) -> Result<()> {
+    fn send_detail_to_agent(&mut self, additional_instructions: Option<&str>) -> Result<()> {
         let running = self.running_comment_ids();
 
         let Screen::CommentDetail { entry, parent } = &self.screen else {
@@ -798,7 +844,8 @@ impl App {
             url: entry.url.clone(),
             has_thumbs_up: false,
         };
-        let prompt = agent::build_prompt(&parent.pr, &[&comment]);
+        let prompt =
+            agent::build_prompt_with_additional(&parent.pr, &[&comment], additional_instructions);
         let model = self.selected_model.clone();
         let cwd = env::current_dir()?;
         let comment_ids = vec![entry.comment_id.clone()];
@@ -870,6 +917,30 @@ impl App {
                 self.add_reply_to_screen(&thread_id, "you".to_owned(), body);
             }
             Err(e) => self.set_screen_message(format!("Error: {e}"), true),
+        }
+
+        Ok(())
+    }
+
+    async fn submit_additional_instructions(&mut self) -> Result<()> {
+        let Popup::AdditionalInstructions(ref state) = self.popup else {
+            return Ok(());
+        };
+
+        let raw_text = state.text();
+        let target = state.target;
+        let extra_owned = raw_text.trim().to_owned();
+        let extra = if extra_owned.is_empty() {
+            None
+        } else {
+            Some(extra_owned.as_str())
+        };
+
+        self.popup = Popup::None;
+
+        match target {
+            AgentDispatchTarget::CommentList => self.send_to_agent(extra)?,
+            AgentDispatchTarget::CommentDetail => self.send_detail_to_agent(extra)?,
         }
 
         Ok(())

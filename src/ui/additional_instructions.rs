@@ -4,46 +4,39 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::app::AgentDispatchTarget;
+
 use super::status_bar::{self, KeyHint};
 use super::text_buffer::TextBufferState;
 use super::theme;
 
-/// State for the reply text-input popup.
-pub struct ReplyState {
-    pub thread_id: String,
-    #[allow(dead_code)]
-    pub pr_number: u64,
-    pub path: String,
+pub struct AdditionalInstructionsState {
+    pub target: AgentDispatchTarget,
     buffer: TextBufferState,
 }
 
-impl ReplyState {
-    pub fn new(thread_id: String, pr_number: u64, path: String) -> Self {
+impl AdditionalInstructionsState {
+    pub fn new(target: AgentDispatchTarget) -> Self {
         Self {
-            thread_id,
-            pr_number,
-            path,
+            target,
             buffer: TextBufferState::new(),
         }
     }
 
-    /// Get the full reply text.
     pub fn text(&self) -> String {
         self.buffer.text()
     }
 
-    /// Handle a key input event.
     pub fn handle_input(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         self.buffer.handle_input(code, modifiers);
     }
 }
 
-/// Render the reply popup as a centred overlay.
-pub fn render(frame: &mut Frame, state: &ReplyState) {
+pub fn render(frame: &mut Frame, state: &AdditionalInstructionsState) {
     let area = frame.area();
     let popup = centered_popup(
-        (area.width * 60 / 100).max(40),
-        (area.height * 50 / 100).max(10),
+        (area.width * 65 / 100).max(50),
+        (area.height * 55 / 100).max(12),
         area,
     );
 
@@ -51,16 +44,15 @@ pub fn render(frame: &mut Frame, state: &ReplyState) {
 
     let [header_area, body_area, hint_area] = Layout::vertical([
         Constraint::Length(2),
-        Constraint::Min(3),
+        Constraint::Min(4),
         Constraint::Length(1),
     ])
     .areas(popup);
 
-    // Header: file path.
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(" Reply to: ", theme::accent()),
-        Span::styled(&state.path, theme::text()),
-    ]))
+    let header = Paragraph::new(Line::from(vec![Span::styled(
+        " Additional instructions (optional)",
+        theme::accent(),
+    )]))
     .block(
         Block::default()
             .borders(Borders::BOTTOM)
@@ -69,7 +61,6 @@ pub fn render(frame: &mut Frame, state: &ReplyState) {
     .style(theme::text());
     frame.render_widget(header, header_area);
 
-    // Body: text area with cursor.
     let cursor = state.buffer.cursor();
     let mut lines: Vec<Line<'_>> = state
         .buffer
@@ -78,7 +69,6 @@ pub fn render(frame: &mut Frame, state: &ReplyState) {
         .enumerate()
         .map(|(row, line)| {
             if row == cursor.0 {
-                // Show cursor as a block character.
                 let col = cursor.1;
                 let (before, after) = line.split_at(col.min(line.len()));
                 let cursor_char = after.chars().next().unwrap_or(' ');
@@ -105,7 +95,7 @@ pub fn render(frame: &mut Frame, state: &ReplyState) {
     let body = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" Message ")
+                .title(" Instructions ")
                 .title_style(theme::accent())
                 .borders(Borders::ALL)
                 .border_style(theme::border_active()),
@@ -113,7 +103,6 @@ pub fn render(frame: &mut Frame, state: &ReplyState) {
         .wrap(Wrap { trim: false });
     frame.render_widget(body, body_area);
 
-    // Hints.
     status_bar::render(
         frame,
         hint_area,
