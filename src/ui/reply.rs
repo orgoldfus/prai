@@ -1,11 +1,11 @@
 use crossterm::event::{KeyCode, KeyModifiers};
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::status_bar::{self, KeyHint};
-use super::text_buffer::TextBufferState;
+use super::text_buffer::{self, TextBufferState};
 use super::theme;
 
 /// State for the reply text-input popup.
@@ -41,7 +41,7 @@ impl ReplyState {
 /// Render the reply popup as a centred overlay.
 pub fn render(frame: &mut Frame, state: &ReplyState) {
     let area = frame.area();
-    let popup = centered_popup(
+    let popup = super::centered_popup(
         (area.width * 60 / 100).max(40),
         (area.height * 50 / 100).max(10),
         area,
@@ -70,37 +70,7 @@ pub fn render(frame: &mut Frame, state: &ReplyState) {
     frame.render_widget(header, header_area);
 
     // Body: text area with cursor.
-    let cursor = state.buffer.cursor();
-    let mut lines: Vec<Line<'_>> = state
-        .buffer
-        .lines()
-        .iter()
-        .enumerate()
-        .map(|(row, line)| {
-            if row == cursor.0 {
-                // Show cursor as a block character.
-                let col = cursor.1;
-                let (before, after) = line.split_at(col.min(line.len()));
-                let cursor_char = after.chars().next().unwrap_or(' ');
-                let rest = if after.len() > cursor_char.len_utf8() {
-                    &after[cursor_char.len_utf8()..]
-                } else {
-                    ""
-                };
-                Line::from(vec![
-                    Span::styled(before, theme::text()),
-                    Span::styled(cursor_char.to_string(), theme::selected()),
-                    Span::styled(rest, theme::text()),
-                ])
-            } else {
-                Line::styled(line, theme::text())
-            }
-        })
-        .collect();
-
-    if lines.is_empty() {
-        lines.push(Line::styled("", theme::subtext()));
-    }
+    let lines = text_buffer::render_lines(&state.buffer);
 
     let body = Paragraph::new(lines)
         .block(
@@ -130,12 +100,3 @@ pub fn render(frame: &mut Frame, state: &ReplyState) {
     );
 }
 
-fn centered_popup(width: u16, height: u16, area: Rect) -> Rect {
-    let vertical = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .split(area);
-    let horizontal = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .split(vertical[0]);
-    horizontal[0]
-}

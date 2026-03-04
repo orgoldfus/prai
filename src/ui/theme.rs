@@ -97,3 +97,16 @@ pub fn error() -> Style {
 pub fn checkbox() -> Style {
     Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)
 }
+
+/// Return the appropriate style for a single diff line.
+pub fn diff_line_style(line: &str) -> Style {
+    if line.starts_with('+') {
+        diff_add()
+    } else if line.starts_with('-') {
+        diff_del()
+    } else if line.starts_with("@@") {
+        subtext()
+    } else {
+        text()
+    }
+}

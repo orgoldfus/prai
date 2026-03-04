@@ -100,6 +100,43 @@ impl TextBufferState {
     }
 }
 
+/// Render the buffer contents with a block-cursor on the active line.
+pub fn render_lines<'a>(buffer: &'a TextBufferState) -> Vec<ratatui::text::Line<'a>> {
+    use ratatui::text::{Line, Span};
+
+    let cursor = buffer.cursor();
+    let mut lines: Vec<Line<'a>> = buffer
+        .lines()
+        .iter()
+        .enumerate()
+        .map(|(row, line)| {
+            if row == cursor.0 {
+                let col = cursor.1;
+                let (before, after) = line.split_at(col.min(line.len()));
+                let cursor_char = after.chars().next().unwrap_or(' ');
+                let rest = if after.len() > cursor_char.len_utf8() {
+                    &after[cursor_char.len_utf8()..]
+                } else {
+                    ""
+                };
+                Line::from(vec![
+                    Span::styled(before.to_owned(), super::theme::text()),
+                    Span::styled(cursor_char.to_string(), super::theme::selected()),
+                    Span::styled(rest.to_owned(), super::theme::text()),
+                ])
+            } else {
+                Line::styled(line.to_owned(), super::theme::text())
+            }
+        })
+        .collect();
+
+    if lines.is_empty() {
+        lines.push(Line::styled("".to_owned(), super::theme::subtext()));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::TextBufferState;

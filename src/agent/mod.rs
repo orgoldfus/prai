@@ -152,4 +152,44 @@ mod tests {
         let add_idx = prompt.find("## Additional Instructions").unwrap();
         assert!(add_idx > base_idx);
     }
+
+    #[test]
+    fn multi_comment_prompt_numbers_comments() {
+        let pr = sample_pr();
+        let c1 = sample_comment();
+        let mut c2 = sample_comment();
+        c2.id = "c2".to_owned();
+        c2.body = "Fix naming.".to_owned();
+        c2.path = "src/util.rs".to_owned();
+
+        let prompt = build_prompt_with_additional(&pr, &[&c1, &c2], None);
+
+        assert!(prompt.contains("## Review Comments (2 comments)"));
+        assert!(prompt.contains("### Comment 1"));
+        assert!(prompt.contains("### Comment 2"));
+        assert!(prompt.contains("Handle empty input."));
+        assert!(prompt.contains("Fix naming."));
+    }
+
+    #[test]
+    fn long_pr_body_is_truncated() {
+        let mut pr = sample_pr();
+        pr.body = "x".repeat(3000);
+        let comment = sample_comment();
+
+        let prompt = build_prompt_with_additional(&pr, &[&comment], None);
+
+        assert!(prompt.contains('…'));
+        assert!(!prompt.contains(&"x".repeat(3000)));
+    }
+
+    #[test]
+    fn single_comment_uses_singular_heading() {
+        let pr = sample_pr();
+        let comment = sample_comment();
+        let prompt = build_prompt_with_additional(&pr, &[&comment], None);
+
+        assert!(prompt.contains("## Review Comment\n"));
+        assert!(!prompt.contains("### Comment 1"));
+    }
 }

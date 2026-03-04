@@ -423,4 +423,58 @@ mod tests {
             Some(AgentStreamEvent::Info("plain text chunk".to_owned()))
         );
     }
+
+    #[test]
+    fn parses_error_event() {
+        let chunk = StreamChunk::Stdout(
+            r#"{"type":"error","text":"something went wrong"}"#.to_owned(),
+        );
+        assert_eq!(
+            parse_stream_chunk(&chunk),
+            Some(AgentStreamEvent::Error("something went wrong".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parses_done_event() {
+        let chunk = StreamChunk::Stdout(r#"{"type":"done"}"#.to_owned());
+        assert_eq!(parse_stream_chunk(&chunk), Some(AgentStreamEvent::Done));
+    }
+
+    #[test]
+    fn empty_stdout_line_returns_none() {
+        let chunk = StreamChunk::Stdout("   ".to_owned());
+        assert_eq!(parse_stream_chunk(&chunk), None);
+    }
+
+    #[test]
+    fn stderr_chunk_is_error() {
+        let chunk = StreamChunk::Stderr("fatal error".to_owned());
+        assert_eq!(
+            parse_stream_chunk(&chunk),
+            Some(AgentStreamEvent::Error("fatal error".to_owned()))
+        );
+    }
+
+    #[test]
+    fn system_chunk_is_info() {
+        let chunk = StreamChunk::System("process exited with status: 0".to_owned());
+        assert_eq!(
+            parse_stream_chunk(&chunk),
+            Some(AgentStreamEvent::Info(
+                "process exited with status: 0".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn embedded_json_in_noisy_output() {
+        let chunk = StreamChunk::Stdout(
+            r#"some prefix {"type":"thinking","text":"hmm"} trailing"#.to_owned(),
+        );
+        assert_eq!(
+            parse_stream_chunk(&chunk),
+            Some(AgentStreamEvent::ThinkingDelta("hmm".to_owned()))
+        );
+    }
 }

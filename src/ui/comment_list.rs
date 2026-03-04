@@ -437,16 +437,10 @@ fn render_code_context(frame: &mut Frame, area: Rect, state: &CommentListState) 
         if !entry.diff_hunk.is_empty() {
             lines.push(Line::styled("── Diff Context ──", theme::subtext()));
             for diff_line in entry.diff_hunk.lines() {
-                let style = if diff_line.starts_with('+') {
-                    theme::diff_add()
-                } else if diff_line.starts_with('-') {
-                    theme::diff_del()
-                } else if diff_line.starts_with("@@") {
-                    theme::subtext()
-                } else {
-                    theme::text()
-                };
-                lines.push(Line::styled(format!("  {diff_line}"), style));
+                lines.push(Line::styled(
+                    format!("  {diff_line}"),
+                    theme::diff_line_style(diff_line),
+                ));
             }
         }
 
@@ -567,6 +561,153 @@ fn log_scroll(total_rows: usize, area: Rect) -> (u16, u16) {
         return (0, 0);
     }
     ((total_rows - visible_lines) as u16, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::types::{PrAuthor, PullRequest, ReviewComment, ReviewThread};
+
+    fn sample_pr() -> PullRequest {
+        PullRequest {
+            number: 1,
+            title: "Test PR".to_owned(),
+            body: String::new(),
+            url: "https://example.com".to_owned(),
+            head_ref_name: "feature".to_owned(),
+            base_ref_name: "main".to_owned(),
+            created_at: String::new(),
+            author: PrAuthor::default(),
+        }
+    }
+
+    fn sample_thread(resolved: bool) -> ReviewThread {
+        ReviewThread {
+            id: "t1".to_owned(),
+            is_resolved: resolved,
+            comments: vec![ReviewComment {
+                id: "c1".to_owned(),
+                body: "Fix this".to_owned(),
+                path: "src/main.rs".to_owned(),
+                line: Some(10),
+                start_line: None,
+                diff_hunk: "@@ -1 +1 @@".to_owned(),
+                author: "reviewer".to_owned(),
+                created_at: String::new(),
+                url: "https://example.com/c1".to_owned(),
+                has_thumbs_up: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn new_filters_resolved_threads() {
+        let pr = sample_pr();
+        let threads = vec![sample_thread(false), sample_thread(true)];
+        let state = CommentListState::new(pr, &threads);
+        assert_eq!(state.entries.len(), 1);
+    }
+
+    #[test]
+    fn new_with_empty_threads() {
+        let pr = sample_pr();
+        let state = CommentListState::new(pr, &[]);
+        assert!(state.entries.is_empty());
+        assert_eq!(state.list_state.selected(), None);
+    }
+
+    #[test]
+    fn toggle_select_skips_running_comments() {
+        let pr = sample_pr();
+        let threads = vec![sample_thread(false)];
+        let mut state = CommentListState::new(pr, &threads);
+
+        let mut running = HashSet::new();
+        running.insert("c1".to_owned());
+
+        state.toggle_select(&running);
+        assert!(!state.selected[0]);
+    }
+
+    #[test]
+    fn toggle_select_works_normally() {
+        let pr = sample_pr();
+        let threads = vec![sample_thread(false)];
+        let mut state = CommentListState::new(pr, &threads);
+
+        let running = HashSet::new();
+        state.toggle_select(&running);
+        assert!(state.selected[0]);
+        state.toggle_select(&running);
+        assert!(!state.selected[0]);
+    }
+
+    #[test]
+    fn select_all_and_deselect_all() {
+        let pr = sample_pr();
+        let mut t2 = sample_thread(false);
+        t2.id = "t2".to_owned();
+        t2.comments[0].id = "c2".to_owned();
+        let threads = vec![sample_thread(false), t2];
+        let mut state = CommentListState::new(pr, &threads);
+
+        state.select_all(&HashSet::new());
+        assert_eq!(state.selected_count(), 2);
+
+        state.deselect_all();
+        assert_eq!(state.selected_count(), 0);
+    }
+
+    #[test]
+    fn selected_entries_falls_back_to_current() {
+        let pr = sample_pr();
+        let threads = vec![sample_thread(false)];
+        let state = CommentListState::new(pr, &threads);
+
+        let entries = state.selected_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].comment_id, "c1");
+    }
+
+    #[test]
+    fn next_previous_wrap_around() {
+        let pr = sample_pr();
+        let mut t2 = sample_thread(false);
+        t2.id = "t2".to_owned();
+        t2.comments[0].id = "c2".to_owned();
+        let threads = vec![sample_thread(false), t2];
+        let mut state = CommentListState::new(pr, &threads);
+
+        assert_eq!(state.list_state.selected(), Some(0));
+        state.next();
+        assert_eq!(state.list_state.selected(), Some(1));
+        state.next();
+        assert_eq!(state.list_state.selected(), Some(0));
+        state.previous();
+        assert_eq!(state.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn add_reply_to_thread_appends() {
+        let pr = sample_pr();
+        let threads = vec![sample_thread(false)];
+        let mut state = CommentListState::new(pr, &threads);
+
+        state.add_reply_to_thread("t1", "alice".to_owned(), "LGTM".to_owned());
+        assert_eq!(state.entries[0].replies.len(), 1);
+        assert_eq!(state.entries[0].replies[0].author, "alice");
+    }
+
+    #[test]
+    fn mark_reacted_tracks_comment_ids() {
+        let pr = sample_pr();
+        let threads = vec![sample_thread(false)];
+        let mut state = CommentListState::new(pr, &threads);
+
+        assert!(!state.reacted.contains("c1"));
+        state.mark_reacted("c1");
+        assert!(state.reacted.contains("c1"));
+    }
 }
 
 fn render_status_bar(

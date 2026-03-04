@@ -143,18 +143,7 @@ fn render_diff(frame: &mut Frame, area: Rect, diff_hunk: &str) {
     } else {
         diff_hunk
             .lines()
-            .map(|l| {
-                let style = if l.starts_with('+') {
-                    theme::diff_add()
-                } else if l.starts_with('-') {
-                    theme::diff_del()
-                } else if l.starts_with("@@") {
-                    theme::subtext()
-                } else {
-                    theme::text()
-                };
-                Line::styled(format!("  {l}"), style)
-            })
+            .map(|l| Line::styled(format!("  {l}"), theme::diff_line_style(l)))
             .collect()
     };
 

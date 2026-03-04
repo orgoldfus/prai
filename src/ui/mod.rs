@@ -170,8 +170,64 @@ pub fn render_model_selector(frame: &mut Frame, state: &mut ModelSelectorState) 
     frame.render_stateful_widget(list, list_area, &mut view_state);
 }
 
+#[cfg(test)]
+mod model_selector_tests {
+    use super::ModelSelectorState;
+
+    #[test]
+    fn new_selects_current_model() {
+        let models = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let state = ModelSelectorState::new(models, "b");
+        assert_eq!(state.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn new_falls_back_to_zero_if_not_found() {
+        let models = vec!["a".to_owned(), "b".to_owned()];
+        let state = ModelSelectorState::new(models, "z");
+        assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn filter_narrows_and_navigates() {
+        let models = vec![
+            "claude-4-sonnet".to_owned(),
+            "gpt-5".to_owned(),
+            "claude-4-opus".to_owned(),
+        ];
+        let mut state = ModelSelectorState::new(models, "claude-4-sonnet");
+
+        state.push_filter_char('g');
+        state.push_filter_char('p');
+        assert_eq!(state.selected_model(), Some("gpt-5"));
+
+        state.pop_filter_char();
+        state.pop_filter_char();
+        state.push_filter_char('c');
+        state.push_filter_char('l');
+        assert_eq!(state.selected_model(), Some("claude-4-sonnet"));
+        state.next();
+        assert_eq!(state.selected_model(), Some("claude-4-opus"));
+    }
+
+    #[test]
+    fn empty_filter_shows_all() {
+        let models = vec!["a".to_owned(), "b".to_owned()];
+        let state = ModelSelectorState::new(models, "a");
+        assert_eq!(state.selected_model(), Some("a"));
+    }
+
+    #[test]
+    fn no_match_selects_none() {
+        let models = vec!["a".to_owned(), "b".to_owned()];
+        let mut state = ModelSelectorState::new(models, "a");
+        state.push_filter_char('z');
+        assert_eq!(state.selected_model(), None);
+    }
+}
+
 /// Return a centred rectangle for popup dialogs.
-fn centered_popup(width: u16, height: u16, area: Rect) -> Rect {
+pub fn centered_popup(width: u16, height: u16, area: Rect) -> Rect {
     let vertical = Layout::vertical([Constraint::Length(height)])
         .flex(Flex::Center)
         .split(area);

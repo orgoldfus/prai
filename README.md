@@ -23,6 +23,7 @@ PRAI is a terminal UI tool that lets you browse your PR review comments and send
 - 💬 **Browse review comments** — view unresolved inline comments with code context
 - ✅ **Multi-select** — select multiple comments to fix in one batch
 - 🤖 **Send to AI agent** — dispatch comments to Cursor CLI (more agents coming)
+- 💬 **Reply to threads** — post replies directly from the TUI
 - 🎨 **Beautiful TUI** — Catppuccin Mocha theme, diff syntax highlighting
 - ⌨️ **Vim-style navigation** — j/k, Enter, Space, and more
 
@@ -34,16 +35,8 @@ PRAI is a terminal UI tool that lets you browse your PR review comments and send
 
 ## Installation
 
-### From source
-
 ```bash
 cargo install --path .
-```
-
-### From crates.io (coming soon)
-
-```bash
-cargo install prai
 ```
 
 ## Usage
@@ -55,7 +48,7 @@ prai
 # Review a specific PR
 prai 42
 
-# Open config file
+# Open config file in your editor
 prai --config
 ```
 
@@ -75,21 +68,40 @@ prai --config
 |-----|--------|
 | `↑/↓` or `j/k` | Navigate |
 | `Space` | Toggle select |
-| `a` | Send to AI agent (optional instructions) |
+| `Ctrl+a` | Select all |
+| `Ctrl+d` | Deselect all |
+| `a` | Send to AI agent (with optional instructions) |
 | `l` | Toggle agent output panel |
 | `v` | Toggle output view (UI/raw) |
 | `[` / `]` | Switch agent job in panel |
 | `m` | Choose model |
 | `o` | Open in browser |
 | `t` | 👍 React |
-| `r` | Reply (coming soon) |
+| `r` | Reply to thread |
 | `Enter` | View detail |
-| `q` | Back |
+| `q` | Back to PR list |
 | `Ctrl+C` | Quit |
+
+### Comment Detail
+
+| Key | Action |
+|-----|--------|
+| `a` | Send this comment to agent |
+| `r` | Reply to thread |
+| `o` | Open in browser |
+| `t` | 👍 React |
+| `q` | Back to comment list |
+
+### Reply / Additional Instructions Popup
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+s` | Submit |
+| `Esc` | Cancel |
 
 ## Configuration
 
-Config file: `~/.config/prai/config.toml`
+Config file: `~/.config/prai/config.toml` (auto-created on first run)
 
 ```toml
 [agent]
@@ -105,10 +117,62 @@ splash_duration_ms = 1500     # Splash screen duration
 
 PRAI is built with extensibility in mind:
 
-- **`GitProvider` trait** — currently GitHub via `gh` CLI, easily extendable to GitLab/Bitbucket
-- **`AgentProvider` trait** — currently Cursor CLI, easily extendable to Claude Code, Aider, etc.
-- **ratatui** — fast, lightweight TUI framework
-- **GraphQL** — uses GitHub's GraphQL API to get review thread resolution status
+- **`GitProvider` trait** (`src/github/provider.rs`) — abstracts git hosting. Currently GitHub via `gh` CLI; extendable to GitLab, Bitbucket, etc.
+- **`AgentProvider` trait** (`src/agent/provider.rs`) — abstracts AI coding agents. Currently Cursor CLI; extendable to Claude Code, Aider, etc.
+- **ratatui** — fast, lightweight TUI framework with Catppuccin Mocha theme
+- **GraphQL** — uses GitHub's GraphQL API for review thread resolution status
+
+### Module overview
+
+```
+src/
+├── main.rs              CLI entry point, preflight checks
+├── config.rs            TOML config loading/saving
+├── git.rs               Git helpers (branch, remote URL parsing)
+├── app/
+│   ├── mod.rs           App struct, main loop, rendering dispatch
+│   ├── keys.rs          Keyboard event handlers for each screen
+│   └── actions.rs       Agent dispatch, reply submission, transitions
+├── agent/
+│   ├── provider.rs      AgentProvider trait
+│   ├── cursor.rs        Cursor CLI implementation
+│   ├── stream.rs        Agent output stream parsing
+│   └── mod.rs           Prompt building
+├── github/
+│   ├── provider.rs      GitProvider trait
+│   ├── client.rs        GitHub CLI / GraphQL implementation
+│   └── types.rs         Data types (PullRequest, ReviewComment, etc.)
+└── ui/
+    ├── mod.rs            Model selector popup, shared utilities
+    ├── theme.rs          Catppuccin Mocha palette and semantic styles
+    ├── splash.rs         Splash screen
+    ├── pr_list.rs        PR selection screen
+    ├── comment_list.rs   Comment list screen and agent panel
+    ├── comment_detail.rs Full-screen comment detail view
+    ├── reply.rs          Reply popup
+    ├── additional_instructions.rs  Additional instructions popup
+    ├── agent_timeline.rs Agent output timeline rendering
+    ├── text_buffer.rs    Multi-line text input buffer
+    └── status_bar.rs     Bottom status bar with key hints
+```
+
+## Development
+
+```bash
+cargo check              # Type-check without building
+cargo build              # Debug build
+cargo build --release    # Release build (LTO + stripped)
+cargo test               # Run tests
+cargo test parse_ssh_url # Run a specific test
+cargo clippy             # Lint
+cargo run                # Run directly
+cargo run -- 42          # Specific PR number
+cargo run -- --config    # Open config file
+```
+
+### For AI agents
+
+See [`AGENTS.md`](./AGENTS.md) for detailed guidance on working with this codebase.
 
 ## License
 
