@@ -1,40 +1,21 @@
 # AGENTS.md
 
-This file provides guidance to WARP (warp.dev) when working with code in this repository.
+PRAI is a Rust TUI tool for browsing PR review comments and dispatching them to an AI agent for fixing. Uses `gh` CLI for GitHub interaction and `cursor-agent` CLI for AI agent integration.
 
-## Project Overview
-
-PRAI is a Rust terminal UI (TUI) tool that lets you browse PR review comments and dispatch them to an AI agent for fixing. It uses `gh` CLI for GitHub interaction and `cursor-agent` CLI for AI agent integration.
-
-## Build & Development Commands
+## Build & Test Commands
 
 ```bash
-# Build
-cargo build
+cargo build                # dev build
+cargo build --release      # release (LTO, stripped)
+cargo run                  # run directly
+cargo run -- 42            # specific PR number
+cargo run -- --config      # open config file
+cargo install --path .     # install locally
 
-# Build release (with LTO, stripped)
-cargo build --release
-
-# Run directly
-cargo run
-cargo run -- 42          # specific PR number
-cargo run -- --config    # open config file
-
-# Install locally
-cargo install --path .
-
-# Run tests
-cargo test
-
-# Run a single test
-cargo test <test_name>
-# e.g. cargo test parse_ssh_url
-
-# Check without building
-cargo check
-
-# Lint
-cargo clippy
+cargo test                 # all tests
+cargo test <test_name>     # single test, e.g. cargo test parse_ssh_url
+cargo check                # typecheck without building
+cargo clippy               # lint
 ```
 
 ## Architecture
@@ -43,9 +24,11 @@ cargo clippy
 
 `main.rs` → CLI parsing (clap) → preflight checks (git repo? gh auth?) → load config → create `App` → run TUI event loop.
 
-### Screen State Machine (`app.rs`)
+### Screen & Popup State Machine (`src/app/`)
 
-The app uses a `Screen` enum to manage navigation between views:
+The `app` module is split into `mod.rs` (state + main loop + rendering), `keys.rs` (key handlers), and `actions.rs` (agent dispatch, reply submission).
+
+Screens (`Screen` enum):
 
 ```
 Splash → (auto-detect PR for branch) → CommentList
@@ -53,28 +36,36 @@ Splash → (auto-detect PR for branch) → CommentList
 CommentList ↔ CommentDetail
 ```
 
-`App` owns the current `Screen`, the `GitHubClient`, the `CursorAgent`, and cached model state. The main loop in `App::run()` is a standard ratatui render-then-poll-events loop with async key handlers.
+Overlay popups (`Popup` enum) render on top of the current screen:
+- `ModelSelector` — fuzzy-filter model picker
+- `Reply` — compose and submit a review thread reply
+- `AdditionalInstructions` — optional extra instructions before agent dispatch
+
+`App` owns the current `Screen`, `Popup`, `GitHubClient`, agent job queue, and cached model state. The main loop polls background model fetches, agent job streams, and keyboard events at 50 ms intervals.
+
+### Agent Jobs & Streaming (`src/agent/`)
+
+Agent work is tracked as `AgentJob` structs with background `JoinHandle`s. `stream.rs` defines `StreamChunk` (stdout/stderr/system) and `AgentStreamEvent` (thinking, assistant, tool start/update/end, error, done). The stream parser handles JSON fragments from `cursor-agent --output-format stream-json`.
+
+The `AgentTimeline` (`src/ui/agent_timeline.rs`) consumes these events to build a structured view of agent activity (thinking, tool calls, errors, completion).
 
 ### Provider Traits
 
-Two extension-point traits define the boundaries between the core app and external services:
+Two extension-point traits define the boundaries to external services:
 
-- **`GitProvider`** (`src/github/provider.rs`) — abstracts git hosting (list PRs, fetch review threads, add reactions, reply). Currently implemented by `GitHubClient` which shells out to the `gh` CLI and uses GitHub's GraphQL API for thread resolution status.
-- **`AgentProvider`** (`src/agent/provider.rs`) — abstracts AI coding agents (list models, execute prompt). Currently implemented by `CursorAgent` which shells out to `cursor-agent`.
-
-To add a new git host or agent, implement the corresponding trait.
-
-### GitHub Client (`src/github/client.rs`)
-
-Uses `gh` CLI for REST-style operations and raw GraphQL queries (via `gh api graphql`) for data that requires it (review thread `isResolved` status). Types in `src/github/types.rs` are deserialized from `gh` JSON output using `serde_json`.
+- **`GitProvider`** (`src/github/provider.rs`) — list PRs, fetch review threads, add reactions, reply to threads. Implemented by `GitHubClient` which uses `gh` CLI + GraphQL for thread resolution status.
+- **`AgentProvider`** (`src/agent/provider.rs`) — list models, execute prompt. Implemented by `CursorAgent` which shells out to `cursor-agent`.
 
 ### Model Caching (`src/agent/cursor.rs`)
 
-Models are fetched in a background tokio task at startup. Three-level fallback: live CLI fetch → disk cache (`~/.config/prai/models_cache.json`) → compile-time defaults. This keeps the app startup instant.
+Models are fetched in a background tokio task at startup. Three-level fallback: live CLI → disk cache (`~/.config/prai/models_cache.json`) → compile-time defaults.
 
 ### UI Layer (`src/ui/`)
 
-Built with `ratatui` and `crossterm`. Each screen has its own module with a `render()` function and state struct. The Catppuccin Mocha theme is defined in `theme.rs` as semantic style functions (e.g., `theme::accent()`, `theme::diff_add()`). All UI styling should go through these functions rather than using raw colors.
+Built with `ratatui` + `crossterm`. Each screen/popup has its own module with a `render()` function and state struct. Shared utilities:
+- `theme.rs` — Catppuccin Mocha semantic styles (`theme::accent()`, `theme::diff_add()`, etc.). All styling goes through these.
+- `status_bar.rs` — reusable key-hint bar rendered at the bottom of popups.
+- `text_buffer.rs` — multiline text input with cursor navigation (used by Reply and AdditionalInstructions).
 
 ### Configuration (`src/config.rs`)
 
@@ -82,14 +73,14 @@ TOML config at `~/.config/prai/config.toml`. Auto-created with defaults on first
 
 ## Key Conventions
 
-- All external process calls (`gh`, `cursor-agent`, `git`) use `tokio::process::Command` for async execution (except `git` helpers in `src/git.rs` which use `std::process::Command` since they're sync).
-- Error handling uses `anyhow` throughout with `.context()` for wrapping.
-- The `Screen` enum uses `std::mem::replace` to move state between screens (e.g., moving `CommentListState` into/out of `CommentDetail`).
-- UI state structs (e.g., `CommentListState`, `PrListState`) own both data and ratatui `ListState` for selection tracking.
+- External process calls (`gh`, `cursor-agent`) use `tokio::process::Command`. Git helpers in `src/git.rs` use `std::process::Command` (sync).
+- Error handling uses `anyhow` with `.context()` for wrapping.
+- `Screen` transitions use `std::mem::replace` to move owned state between variants.
+- UI state structs own both data and ratatui `ListState` for selection tracking.
 
 ## Code Quality Rules
 
-- All code must adhere to Rust best practices (idiomatic error handling, proper use of ownership/borrowing, meaningful types, etc.).
-- Follow DRY (Don't Repeat Yourself) — extract shared logic into functions, traits, or modules rather than duplicating it.
-- Follow KISS (Keep It Simple, Stupid) — prefer straightforward, readable solutions over clever or over-engineered ones.
-- Avoid AI slop: no redundant or obvious comments (e.g., `// return the value` before a return statement), no boilerplate doc comments that just restate the function signature, and no filler text. Comments should only exist when they explain *why*, not *what*.
+- Idiomatic Rust: proper ownership/borrowing, meaningful types, `anyhow` error handling.
+- DRY — extract shared logic into functions, traits, or modules.
+- KISS — prefer straightforward solutions over clever ones.
+- No AI slop: no redundant comments restating obvious code, no boilerplate doc comments that just restate the function signature, no filler. Comments explain *why*, not *what*.
